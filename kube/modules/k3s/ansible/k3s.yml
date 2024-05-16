@@ -1,0 +1,119 @@
+---
+- name: Install k3s
+  hosts: k3snodes
+  vars:
+    k3s_install_script: "{{ansible_env.HOME}}/k3s.sh"
+    kube_config_remote_location: /etc/rancher/k3s/k3s.yaml
+    nvidia_distro: "{{ ansible_distribution|lower }}{{ ansible_distribution_version|regex_replace('\\.','') }}"
+    nvidia_device_plugin_version: "0.12.3"
+  any_errors_fatal: true
+  become: true
+  gather_facts: true
+  tasks:
+    - name: "increase fs.inotify.max_user_watches"
+      sysctl:
+        name: fs.inotify.max_user_watches
+        value: "524288"
+        state: present
+
+    - name: set sysctl for elasticsearch
+      sysctl:
+        name: vm.max_map_count
+        value: "262144"
+        state: present
+
+    - name: dearmor helm gpg key
+      ansible.builtin.shell: curl -fsSL https://baltocdn.com/helm/signing.asc | gpg --dearmor --yes -o /usr/share/keyrings/helm.gpg
+
+    - name: Add helm repo
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main"
+        update_cache: true
+
+    - name: Install requirements
+      ansible.builtin.apt:
+        name:
+          - python3-pip
+          - helm
+        update_cache: yes
+        install_recommends: no
+        state: present
+
+    - name: Install required pip packages
+      ansible.builtin.pip:
+        name:
+          - kubernetes==26.1.0
+          - pyyaml
+
+    - name: Custom dns command
+      ansible.builtin.set_fact:
+        k3s_use_custom_dns: "--resolv-conf /etc/customdns.conf"
+      when: use_custom_dns == "true"
+
+    - name: Copy custom resolv file
+      ansible.builtin.copy:
+        src: files/customdns.conf
+        dest: /etc/customdns.conf
+      when: use_custom_dns == "true"
+
+    - name: Get k3s version
+      ansible.builtin.command: k3s --version
+      register: k3s_installed_version_output
+      ignore_errors: yes
+
+    - name: Get k3s version number
+      ansible.builtin.set_fact:
+        k3s_installed_version: "{{ k3s_installed_version_output['stdout'] | regex_search('^k3s version (.*) \\(.*\\)', '\\1') | first }}"
+      when: k3s_installed_version_output['failed'] == false
+
+    - name: Decide if k3s needs to be installed
+      ansible.builtin.set_fact:
+        k3s_must_be_installed: "{{ k3s_installed_version | default('') != airwave_install_k3s_version }}"
+
+    # - name: Print return information from the previous task
+    #   ansible.builtin.debug:
+    #     var: k3s_must_be_installed
+
+    - name: Download k3s installer script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: "{{ k3s_install_script }}"
+        mode: "755"
+      when: k3s_must_be_installed
+
+    - name: install k3s cluster
+      ansible.builtin.command: "{{ k3s_install_script }}"
+      environment:
+        INSTALL_K3S_VERSION: "{{airwave_install_k3s_version}}"
+        INSTALL_K3S_EXEC: "server  {{k3s_use_custom_dns | default('')}} --disable traefik --token {{airwave_k3s_token}} --write-kubeconfig-mode 644"
+      when: k3s_must_be_installed
+
+    - name: Install nvidia drivers for k3s
+      include_tasks: nvidia.yml
+      when: airwave_accelerator_platform == "nvidia"
+
+    - name: Remove custom dns entries
+      kubernetes.core.k8s:
+        state: absent
+        template:
+          path: "files/core-dns.j2"
+          domain_name: "{{domain_name}}"
+          proxy_service_url: "{{proxy_service_url}}"
+        kubeconfig: "{{kube_config_remote_location}}"
+
+    - name: Create custom dns entries
+      kubernetes.core.k8s:
+        state: present
+        template:
+          path: "files/core-dns.j2"
+          domain_name: "{{domain_name}}"
+          proxy_service_url: "{{proxy_service_url}}"
+        kubeconfig: "{{kube_config_remote_location}}"
+
+    - name: Restart k3s service after dns config change
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+
+    - name: Prepare output for terraform external plugin
+      include_tasks: terraform.yml

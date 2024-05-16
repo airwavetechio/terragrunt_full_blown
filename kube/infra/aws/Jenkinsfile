@@ -1,0 +1,132 @@
+@Library('jenkins-shared-library@development') _
+
+// Determine selected service account
+final DEPLOYER_SERVICE_ACCOUNT_ID = 'terraform-the-builder-sa-key-airwave-shared-admin'
+
+pipeline {
+    agent {
+        label 'azureslave'
+    }
+    stages {
+        stage('Validate Build') {
+        steps {
+          script {
+              if (params.airwave_stack_name.contains("-")) {
+                input(message: "AWS does not like dashes in the DB admin username, and the admin DB username is the stack name, so the stack name '${params.airwave_stack_name}' might fail. Run anyway?", ok: "Yes")
+              }
+            }
+          }
+        }
+        stage('Checkout') {
+            steps {
+                checkout poll: false, scm: [
+                        $class: 'GitSCM',
+                        branches: [[name: params.deploy_version]],
+                        userRemoteConfigs: [[credentialsId: 'jenkins_gitlab_deploy_key', url: 'git@gitlab.com:ubq/deploy.git']]
+                ]
+            }
+        }
+        stage('provision') {
+            steps {
+                script {
+                    docker.withRegistry('https://registry.hub.docker.com', 'airwave_dockerhub_admin') {
+                            try {
+                                docker.image('airwave/ci-builder:79').inside("-u root:root --privileged") {
+                                    sshagent (credentials: ['gocd_ssh_key']) {
+                                        def tfvar_file = "${env.WORKSPACE}/kube/infra/aws/terraform.tfvars.json"
+                                        def pv_settings = null
+                                        if(params.pv_settings?.trim() != null) {
+                                            pv_settings = readJSON text: params.pv_settings
+                                        }
+                                        def parameters = [
+                                            proxy_service_url: "proxy.${params.airwave_stack_name}-foundation.svc.cluster.local",
+                                            certbot_enabled: false,
+                                            //docker_registry_username: env.USERNAME,
+                                            //docker_registry_password: env.PASSWORD,
+                                            docker_registry_email: "devops@airwave.com",
+                                            docker_registry_server: "https://index.docker.io/v1/",
+                                            // Parameters set in the Jenkins job
+                                            aws_region: params.region,
+                                            airwave_version: params.airwave_version,
+                                            airwave_size: params.airwave_size,
+                                            airwave_license: params.airwave_license,
+                                            airwave_stack_name: params.airwave_stack_name,
+                                            domain_name: "${params.airwave_stack_name}.${params.domain}",
+                                            aws_region: params.region,
+                                            eks_num_nodes: params.eks_num_nodes,
+                                            eks_num_gpu_nodes: params.eks_num_gpu_nodes,
+                                            gpu_node_type: params.gpu_node_type,
+                                            node_type: params.node_type,
+                                            hf_auth_key: stringFromParamOrCredential("hf_auth_key", "airwave_app_deploy_hf_auth_key"),
+                                            ssl: [
+                                                enabled: true,
+                                                certbot_enabled: false,
+                                                certbot_email: null,
+                                                certbot_cert_update_job_schedule: null,
+                                                certbot_health_check_url: null,
+                                                certbot_test_mode: false
+                                            ],
+                                            gpu_shape: params.gpu_shape ?: "demo",
+                                            pv_settings: pv_settings,
+                                        ]
+                                        withCredentials([
+                                            [$class: 'UsernamePasswordMultiBinding', credentialsId: 'dockerhub_service_user', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']
+                                        ]){
+                                                parameters.docker_registry_username = env.USERNAME
+                                                parameters.docker_registry_password = env.PASSWORD
+                                        }
+                                        writeJSON file: tfvar_file, json: parameters
+                                        dir("kube/infra/aws/modules") {
+                                            withCredentials([
+                                                file(credentialsId: DEPLOYER_SERVICE_ACCOUNT_ID, variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                                                [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: aws_credentials, accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']
+                                            ]){
+                                                def gcp_file = "${env.WORKSPACE}/kube/infra/aws/service_account.json"
+                                                writeFile file: gcp_file, text: readFile(GOOGLE_APPLICATION_CREDENTIALS)
+                                                ansiColor('xterm') {
+                                                    if(params.action == "plan") {
+                                                        sh "terragrunt run-all ${params.action} -compact-warnings --var-file=${tfvar_file}"
+                                                    }else {
+                                                        if(params.action == "destroy") {
+                                                            input message: 'Would you like to destroy?', ok: 'Yes'
+                                                        }
+                                                        sh "terragrunt run-all ${params.action} -auto-approve -compact-warnings --terragrunt-non-interactive --var-file=${tfvar_file}"
+                                                    }
+
+                                                    if(params.action != "destroy") {
+                                                        def outputJson = readTgOut("100-airwave/baremetal")
+
+                                                         sh """
+                                                            set +x
+                                                            printf '\n\n'
+                                                            printf '🚀\n'
+                                                            printf '🚀🚀\n'
+                                                            printf '🚀🚀🚀 Deployment complete – ${outputJson.domain_name.value}\n'
+                                                            printf '🚀🚀\n'
+                                                            printf '🚀\n'
+                                                            printf '\n\n'
+                                                            printf 'Access details:\n'
+                                                            printf 'Keycloak admin password: ${outputJson.keycloak_master_password.value}\n'
+                                                            printf '\n\n'
+                                                        """
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } finally {
+                                currentBuild.result = currentBuild.currentResult
+                                cleanWs()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+def readTgOut(modulepath){
+    def  output = sh(script: "cd ${modulepath} && terragrunt output -json", returnStdout: true)
+    def json = readJSON(text: output)
+    return json
+}

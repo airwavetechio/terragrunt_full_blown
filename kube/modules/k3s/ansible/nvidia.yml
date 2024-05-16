@@ -1,0 +1,142 @@
+---
+- name: Remove old Nvidia apt key
+  apt_key:
+    id: "7fa2af80"
+    state: absent
+
+- name: Remove nvidia ppa
+  apt_repository:
+    repo: ppa:graphics-drivers/ppa
+    state: absent
+
+- name: Download nvidia pin file
+  get_url:
+    url: https://developer.download.nvidia.com/compute/cuda/repos/{{nvidia_distro}}/x86_64/cuda-{{nvidia_distro}}.pin
+    dest: /etc/apt/preferences.d/cuda-repository-pin-600
+    owner: "root"
+    group: "root"
+    mode: "0644"
+
+- name: Add nvidia repo key
+  apt_key:
+    url: "https://developer.download.nvidia.com/compute/cuda/repos/{{nvidia_distro}}/x86_64/3bf863cc.pub"
+    id: "3bf863cc"
+
+- name: Add nvidia container toolkit key
+  apt_key:
+    url: "https://nvidia.github.io/libnvidia-container/gpgkey"
+    id: "DDCAE044F796ECB0"
+
+- name: Add nvidia repo
+  apt_repository:
+    repo: "deb https://developer.download.nvidia.com/compute/cuda/repos/{{nvidia_distro}}/x86_64/ /"
+
+- name: Add nvidia toolkit repo
+  apt_repository:
+    # 2023-09-14 -- Have to use 'ubuntu18.04' (eg: 'ubuntu20.04' doesn't work)
+    repo: "deb https://nvidia.github.io/libnvidia-container/stable/ubuntu18.04/amd64 /"
+
+- name: Remove old Nvidia packages
+  ansible.builtin.apt:
+    name:
+      - "nvidia-*-390"
+      - "nvidia-*-418"
+      - "nvidia-*-418-server"
+      - "nvidia-*-430"
+      - "nvidia-*-435"
+      - "nvidia-*-440"
+      - "nvidia-*-440-server"
+      - "nvidia-*-450"
+      - "nvidia-*-450-server"
+      - "nvidia-*-460"
+      - "nvidia-*-460-server"
+      - "nvidia-*-465"
+      - "nvidia-*-470"
+      - "nvidia-*-470-server"
+      - "nvidia-*-495"
+      - "nvidia-*-510"
+      - "nvidia-*-510-server"
+      - "nvidia-*-515"
+      - "nvidia-*-515-open"
+      - "nvidia-*-515-server"
+      - "nvidia-*-520"
+      - "nvidia-*-520-open"
+      - "nvidia-*-525"
+      - "nvidia-*-525-open"
+      - "nvidia-*-525-server"
+      - "nvidia-*-530"
+      - "nvidia-*-530-open"
+    state: absent
+    update_cache: true
+    purge: true
+
+- name: Clean up dangling dependencies before installing Nvidia
+  # If we don't clean up dangling dependencies, they can hold
+  # back the dependencies and thereby prevent our driver upgrade
+  # from being installed. See DEV-516 for an example.
+  ansible.builtin.apt:
+    autoremove: true
+
+- name: Install Nvidia and other requirements
+  ansible.builtin.apt:
+    name:
+      - linux-headers-{{ansible_kernel}}
+      - "nvidia-headless-{{nvidia_driver_version}}"
+      - nvidia-container-toolkit
+      - "nvidia-utils-{{nvidia_driver_version}}"
+    install_recommends: false
+    clean: true
+    update_cache: true
+    state: present
+  register: nvidiainstall
+
+- name: Reboot to let Nvidia install take effect
+  ansible.builtin.reboot:
+  when: nvidiainstall.changed
+
+- name: Ensure we have access to the GPU
+  ansible.builtin.command:
+    cmd: /usr/bin/nvidia-smi
+
+- name: Creates k3s containerd dir
+  file:
+    path: /var/lib/rancher/k3s/agent/etc/containerd/
+    state: directory
+    recurse: yes
+
+- name: Copy nvidia k3s containerd template
+  ansible.builtin.copy:
+    src: files/config.toml.tmpl
+    dest: /var/lib/rancher/k3s/agent/etc/containerd/config.toml
+
+- name: Restart k3s service after containerd config change
+  ansible.builtin.service:
+    name: k3s
+    state: restarted
+
+- name: Install kubernetes python package
+  ansible.builtin.pip:
+    name:
+      - kubernetes
+
+- name: Create nvidia runtime class in kubernetes
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('file', 'files/runtime.yaml') | from_yaml }}"
+    kubeconfig: "{{kube_config_remote_location}}"
+
+- name: Add nvdp chart repo
+  kubernetes.core.helm_repository:
+    name: nvdp
+    repo_url: "https://nvidia.github.io/k8s-device-plugin"
+
+- name: Deploy nvdp chart
+  kubernetes.core.helm:
+    name: nvdp
+    release_namespace: nvidia-device-plugin
+    chart_ref: nvdp/nvidia-device-plugin
+    chart_version: "{{nvidia_device_plugin_version}}"
+    create_namespace: yes
+    values:
+      runtimeClassName: nvidia
+    kubeconfig: "{{kube_config_remote_location}}"

@@ -1,0 +1,3 @@
+variable "databases" {
+  default = []
+}

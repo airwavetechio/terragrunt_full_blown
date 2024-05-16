@@ -1,0 +1,14 @@
+---
+- name: Read kubeconfig yaml file
+  ansible.builtin.slurp:
+    src: "{{kube_config_remote_location}}"
+  register: kubeconf
+
+- name: Create dict
+  set_fact:
+    kubeconfvar: "{{ {'kubeconf': kubeconf['content'] | b64decode } }}"
+
+- name: Write kubeconfig yaml file in json for terraform
+  ansible.builtin.copy:
+    content: "{{ kubeconfvar | to_json }}"
+    dest: "{{kube_config_json_path}}"

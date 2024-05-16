@@ -1,0 +1,18 @@
+apiVersion: v1
+data:
+  custom.server: |-
+    {{domain_name}}:53 {
+       errors
+       health {
+          lameduck 5s
+       }
+       ready
+       rewrite stop {
+        name {{domain_name}}. {{proxy_service_url}}
+       }
+       forward . 127.0.0.1:53
+    }
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
